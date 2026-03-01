@@ -245,7 +245,7 @@ obj->myMethod();`;
     });
 
     describe('Scenario 2.6: Go to definition - multiple results', () => {
-        it('should return first matching symbol for same-named symbols', async () => {
+        it('should return nearest matching symbol for same-named symbols', async () => {
             const code = `int myFunc(int x) { return x; }
 string myFunc(string s) { return s; }
 myFunc(42);`;
@@ -271,7 +271,8 @@ myFunc(42);`;
             const result = await definition(2, 2);
             expect(result).not.toBeNull();
             const loc = result as Location;
-            expect(loc.range.start.line).toBe(0);
+            // With scope-aware resolution, picks the nearest preceding definition
+            expect(loc.range.start.line).toBe(1);
         });
     });
 
@@ -812,9 +813,121 @@ Outer.Inner obj = Outer.Inner();`;
                     ],
                 });
 
-                // Scope resolution depends on mock infrastructure
-                const result = await definition(3, 10);
-                expect(result === null || !!(result as Location).uri).toBe(true);
+                // Line 3 char 12 is 'x' in 'int y = x;'
+                // Should resolve to inner x (1-based line 3 = 0-based line 2)
+                // which is the nearest preceding definition
+                const result = await definition(3, 12);
+                expect(result).not.toBeNull();
+                const loc = result as Location;
+                expect(loc.range.start.line).toBe(2);
+            });
+
+            it('should resolve scoped variables in functions with ranges', async () => {
+                // Mirrors the user-reported bug: go-to-definition should resolve to
+                // the nearest scoped variable, not always the first definition.
+                const code = `string qsa = "";
+
+void a() {
+    qsa;
+    int qsa = 1;
+    qsa;
+
+    for(int i = 0; i < 5; i++) {
+        program qsa;
+        qsa;
+    }
+}
+
+void b() {
+    qsa;
+    float qsa = 2.3;
+    qsa;
+}`;
+
+                const { definition } = setup({
+                    code,
+                    symbols: [
+                        // Global scope
+                        { name: 'qsa', kind: 'variable', modifiers: [], position: { file: 'test.pike', line: 1 } },
+                        // Function a() with range
+                        {
+                            name: 'a', kind: 'method', modifiers: [],
+                            position: { file: 'test.pike', line: 3 },
+                            range: { start: { line: 2, character: 0 }, end: { line: 11, character: 1 } },
+                            children: [
+                                { name: 'qsa', kind: 'variable', modifiers: [], position: { file: 'test.pike', line: 5 } },
+                            ],
+                        },
+                        // for-loop scoped qsa inside a() - deeper nesting
+                        { name: 'qsa', kind: 'variable', modifiers: [], position: { file: 'test.pike', line: 9 } },
+                        // Function b() with range
+                        {
+                            name: 'b', kind: 'method', modifiers: [],
+                            position: { file: 'test.pike', line: 14 },
+                            range: { start: { line: 13, character: 0 }, end: { line: 17, character: 1 } },
+                            children: [
+                                { name: 'qsa', kind: 'variable', modifiers: [], position: { file: 'test.pike', line: 16 } },
+                            ],
+                        },
+                    ],
+                });
+
+                // Case 1: qsa in a() BEFORE local declaration (line 3, 0-based)
+                // Should resolve to global 'string qsa' (1-based line 1 -> 0-based line 0)
+                const res1 = await definition(3, 4);
+                expect(res1).not.toBeNull();
+                expect((res1 as Location).range.start.line).toBe(0);
+
+                // Case 2: qsa in a() AFTER local declaration (line 5, 0-based)
+                // Should resolve to 'int qsa' (1-based line 5 -> 0-based line 4)
+                const res2 = await definition(5, 4);
+                expect(res2).not.toBeNull();
+                expect((res2 as Location).range.start.line).toBe(4);
+
+                // Case 3: qsa in b() BEFORE local declaration (line 14, 0-based)
+                // Should resolve to global 'string qsa' (0-based line 0)
+                const res3 = await definition(14, 4);
+                expect(res3).not.toBeNull();
+                expect((res3 as Location).range.start.line).toBe(0);
+
+                // Case 4: qsa in b() AFTER local declaration (line 16, 0-based)
+                // Should resolve to 'float qsa' (1-based line 16 -> 0-based line 15)
+                const res4 = await definition(16, 4);
+                expect(res4).not.toBeNull();
+                expect((res4 as Location).range.start.line).toBe(15);
+            });
+
+            it('should prefer deeper nesting for same-name variables', async () => {
+                const code = `int x = 1;
+void foo() {
+    int x = 2;
+    {
+        int x = 3;
+        x;
+    }
+}`;
+
+                const { definition } = setup({
+                    code,
+                    symbols: [
+                        { name: 'x', kind: 'variable', modifiers: [], position: { file: 'test.pike', line: 1 } },
+                        {
+                            name: 'foo', kind: 'method', modifiers: [],
+                            position: { file: 'test.pike', line: 2 },
+                            range: { start: { line: 1, character: 0 }, end: { line: 7, character: 1 } },
+                            children: [
+                                { name: 'x', kind: 'variable', modifiers: [], position: { file: 'test.pike', line: 3 } },
+                            ],
+                        },
+                        // Block-scoped x (depth 0 in flat list, but line-proximity resolves it)
+                        { name: 'x', kind: 'variable', modifiers: [], position: { file: 'test.pike', line: 5 } },
+                    ],
+                });
+
+                // At line 5 (0-based), reference to x should resolve to 'int x = 3' (line 5, 1-based -> 4 0-based)
+                const result = await definition(5, 8);
+                expect(result).not.toBeNull();
+                expect((result as Location).range.start.line).toBe(4);
             });
         });
 

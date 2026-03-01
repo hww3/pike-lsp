@@ -715,7 +715,102 @@ async function handleDirectiveNavigation(
 }
 
 /**
+ * Find the enclosing method or class symbol for a given line.
+ * Searches for the innermost symbol whose range contains the line.
+ */
+function findEnclosingScopeSymbol(
+    symbols: PikeSymbol[],
+    line: number  // 0-based
+): PikeSymbol | null {
+    let best: PikeSymbol | null = null;
+    let bestSize = Infinity;
+
+    for (const symbol of symbols) {
+        if (symbol.kind !== 'method' && symbol.kind !== 'class') continue;
+
+        // Try range first (0-based)
+        if (symbol.range) {
+            const start = symbol.range.start.line;
+            const end = symbol.range.end.line;
+            if (line >= start && line <= end) {
+                const size = end - start;
+                if (size < bestSize) {
+                    best = symbol;
+                    bestSize = size;
+                }
+                // Also check nested children for tighter scope
+                if (symbol.children) {
+                    const nested = findEnclosingScopeSymbol(symbol.children, line);
+                    if (nested) {
+                        const nestedRange = nested.range;
+                        if (nestedRange) {
+                            const nestedSize = nestedRange.end.line - nestedRange.start.line;
+                            if (nestedSize < bestSize) {
+                                best = nested;
+                                bestSize = nestedSize;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (symbol.position) {
+            // Fallback: use position line (1-based, convert to 0-based)
+            const startLine = (symbol.position.line ?? 1) - 1;
+            if (startLine <= line) {
+                // Without range, we can't know the end. Use this as a candidate
+                // only if it's closer than any range-based match.
+                if (!best || (best && !best.range)) {
+                    const posLine = best?.position ? (best.position.line ?? 1) - 1 : -1;
+                    if (startLine > posLine) {
+                        best = symbol;
+                        bestSize = Infinity; // Unknown size, range-based matches take priority
+                    }
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
+/**
+ * Collect all symbols matching a name, including from nested children.
+ * Returns candidates with their nesting depth and container range.
+ */
+function collectAllMatchingSymbols(
+    symbols: PikeSymbol[],
+    name: string,
+    depth: number,
+    containerRange: { start: number; end: number } | undefined,
+    results: Array<{ symbol: PikeSymbol; depth: number; containerRange: { start: number; end: number } | undefined }>
+): void {
+    for (const symbol of symbols) {
+        if (symbol.name === name) {
+            results.push({ symbol, depth, containerRange });
+        }
+
+        // Also match classname for inherits, imports, and includes
+        if (symbol.kind === 'inherit' || symbol.kind === 'import' || symbol.kind === 'include') {
+            const classname = symbol.classname?.replace(/['"]/g, '');
+            if (classname === name || (classname && classname.includes(name))) {
+                results.push({ symbol, depth, containerRange });
+            }
+        }
+
+        // Recurse into children with updated container range
+        if (symbol.children && symbol.children.length > 0) {
+            const childContainerRange = symbol.range
+                ? { start: symbol.range.start.line, end: symbol.range.end.line }
+                : containerRange;
+            collectAllMatchingSymbols(symbol.children, name, depth + 1, childContainerRange, results);
+        }
+    }
+}
+
+/**
  * Find symbol at given position in document.
+ * Uses scope-aware resolution: when multiple symbols share the same name,
+ * resolves to the nearest definition in the innermost enclosing scope.
  */
 function findSymbolAtPosition(
     symbols: PikeSymbol[],
@@ -741,23 +836,88 @@ function findSymbolAtPosition(
         return null;
     }
 
-    // Find symbol with matching name
-    for (const symbol of symbols) {
-        if (symbol.name === word) {
-            return symbol;
-        }
+    // Collect ALL matching symbols across the full symbol tree
+    const candidates: Array<{ symbol: PikeSymbol; depth: number; containerRange: { start: number; end: number } | undefined }> = [];
+    collectAllMatchingSymbols(symbols, word, 0, undefined, candidates);
 
-        // Match against classname for inherits, imports, and includes (stripping quotes)
-        if (symbol.kind === "inherit" || symbol.kind === "import" || symbol.kind === "include") {
-            const classname = symbol.classname?.replace(/['"]/g, "");
-            // Check if classname matches word or part of it (e.g. Stdio in Stdio.File)
-            if (classname === word || (classname && classname.includes(word))) {
-                return symbol;
-            }
-        }
+    if (candidates.length === 0) {
+        return null;
     }
 
-    return null;
+    // Single match — no ambiguity
+    if (candidates.length === 1 && candidates[0]) {
+        return candidates[0].symbol;
+    }
+
+    // Multiple matches — resolve by scope
+    const cursorLine = position.line; // 0-based
+
+    // Find the enclosing scope (method/class) at the cursor position
+    const cursorScope = findEnclosingScopeSymbol(symbols, cursorLine);
+    const cursorScopeRange = cursorScope?.range
+        ? { start: cursorScope.range.start.line, end: cursorScope.range.end.line }
+        : null;
+
+    // For each candidate, determine if it's visible at the cursor position
+    const visible: typeof candidates = [];
+    for (const c of candidates) {
+        const defLine = (c.symbol.position?.line ?? 1) - 1; // Convert to 0-based
+
+        // Variables/constants must be declared before the cursor line
+        if (c.symbol.kind === 'variable' || c.symbol.kind === 'constant') {
+            if (defLine > cursorLine) continue;
+        }
+
+        // If the candidate has a container range, the cursor must be within it
+        if (c.containerRange) {
+            if (cursorLine < c.containerRange.start || cursorLine > c.containerRange.end) {
+                continue; // Cursor is outside this candidate's scope
+            }
+        }
+
+        // If we know the cursor's scope and the candidate is a nested symbol,
+        // verify the candidate's scope matches or encloses the cursor
+        if (cursorScopeRange && c.containerRange) {
+            // Candidate's container must overlap with cursor's scope
+            if (c.containerRange.start > cursorScopeRange.end || c.containerRange.end < cursorScopeRange.start) {
+                continue;
+            }
+        }
+
+        // For flat symbols (no containerRange, depth 0), check if their enclosing
+        // scope matches the cursor's scope. This prevents local variables from one
+        // function leaking into another function's go-to-definition results.
+        if (!c.containerRange && c.depth === 0 && (c.symbol.kind === 'variable' || c.symbol.kind === 'constant')) {
+            const candidateScope = findEnclosingScopeSymbol(symbols, defLine);
+            if (candidateScope !== null && candidateScope !== cursorScope) {
+                // This candidate is a local variable in a different function — skip it
+                continue;
+            }
+            // candidateScope === null → global scope → always visible
+            // candidateScope === cursorScope → same function → visible
+        }
+
+        visible.push(c);
+    }
+
+    if (visible.length === 0) {
+        // Fall back to first candidate (preserve original behavior)
+        const first = candidates[0];
+        return first ? first.symbol : null;
+    }
+
+    // Sort by closest preceding definition line.
+    // After visibility filtering, all remaining candidates are legitimately in scope.
+    // The closest preceding definition is always the correct one — it shadows
+    // any earlier declarations in the same or enclosing scope.
+    visible.sort((a, b) => {
+        const lineA = (a.symbol.position?.line ?? 1) - 1;
+        const lineB = (b.symbol.position?.line ?? 1) - 1;
+        return lineB - lineA;
+    });
+
+    const best = visible[0];
+    return best ? best.symbol : null;
 }
 
 
