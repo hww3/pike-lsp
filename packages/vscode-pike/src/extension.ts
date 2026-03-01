@@ -12,6 +12,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { ExtensionContext, ConfigurationTarget, Position, Uri, Location, commands, workspace, window, OutputChannel, languages } from 'vscode';
 import { detectPike, getModulePathSuggestions, PikeDetectionResult } from './pike-detector';
+import { PIKE_LANGUAGE_IDS } from './constants';
 import {
     LanguageClient,
     LanguageClientOptions,
@@ -23,6 +24,11 @@ let client: LanguageClient | undefined;
 let serverOptions: ServerOptions | null = null;
 let serverModulePath: string | null = null;
 let outputChannel: OutputChannel;
+
+/** Check if a document is a Pike-family language handled by this extension. */
+function isPikeLanguage(languageId: string): boolean {
+    return (PIKE_LANGUAGE_IDS as readonly string[]).includes(languageId);
+}
 
 /**
  * Extension API exported for testing
@@ -140,7 +146,7 @@ async function activateInternal(context: ExtensionContext, testOutputChannel?: O
         }
 
         const doc = activeEditor.document;
-        if (doc.languageId !== 'pike') {
+        if (!isPikeLanguage(doc.languageId)) {
             window.showInformationMessage('Active file is not a Pike file.');
             return;
         }
@@ -244,12 +250,22 @@ async function activateInternal(context: ExtensionContext, testOutputChannel?: O
 
     // Register deferred activation on first Pike file open
     const fileOpenDisposable = workspace.onDidOpenTextDocument(async (doc) => {
-        if (doc.languageId === 'pike' || doc.languageId === 'rxml' || doc.languageId === 'rjs') {
+        if (isPikeLanguage(doc.languageId)) {
             fileOpenDisposable.dispose();
             await ensureLspStarted();
         }
     });
     context.subscriptions.push(fileOpenDisposable);
+
+    // Check for Pike files already open in editor tabs (e.g., restored session).
+    // Their onDidOpenTextDocument events fired before activate(), so we missed them.
+    const alreadyOpenPikeDoc = workspace.textDocuments.find(
+        doc => isPikeLanguage(doc.languageId)
+    );
+    if (alreadyOpenPikeDoc) {
+        fileOpenDisposable.dispose();
+        await ensureLspStarted();
+    }
 
     // Also start LSP when configuration changes (if already opened a Pike file)
     context.subscriptions.push(
@@ -389,9 +405,7 @@ async function restartClient(showMessage: boolean): Promise<void> {
     const analyzerPath = path.join(extensionRoot, 'server', 'pike-scripts', 'analyzer.pike');
 
     const clientOptions: LanguageClientOptions = {
-        documentSelector: [
-            { scheme: 'file', language: 'pike' },
-        ],
+        documentSelector: PIKE_LANGUAGE_IDS.map(lang => ({ scheme: 'file', language: lang })),
         synchronize: {
             fileEvents: workspace.createFileSystemWatcher('**/*.{pike,pmod}'),
         },
